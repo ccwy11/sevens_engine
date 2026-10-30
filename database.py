@@ -3,8 +3,13 @@ import json
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from contextlib import contextmanager
+from dotenv import load_dotenv
+load_dotenv()          # reads .env from the current working directory
 
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable is not set.")
 
 INIT_SQL = """
 CREATE TABLE IF NOT EXISTS brands (
