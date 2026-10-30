@@ -13,7 +13,7 @@ def start_scanner():
 def start_dashboard():
     import subprocess
     subprocess.run([sys.executable, "-m", "streamlit", "run", "dashboard.py", "--server.port", "8501"])
-
+    subprocess.Popen([sys.executable, "run.py"])
 async def main():
     init_db()
     print("Database initialized.")
