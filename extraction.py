@@ -53,67 +53,96 @@ Important:
 MAX_DIM = 1600
 JPEG_Q = 80
 
+# Global rate-limit smoothing: enforce at least 3 seconds between ANY Moonshot calls
+_last_call_ts = 0.0
 
-def compress_image(image_bytes: bytes) -> bytes:
-    """Resize large phone photos to ~300-500 KB before base64 encoding."""
+
+def _smooth_gap(min_gap: float = 3.0):
+    """Sleep if needed so we don't fire requests too rapidly."""
+    global _last_call_ts
+    elapsed = time.time() - _last_call_ts
+    if elapsed < min_gap:
+        time.sleep(min_gap - elapsed)
+    _last_call_ts = time.time()
+
+
+def compress_image(image_bytes: bytes) -> tuple[bytes, str]:
+    """
+    Resize large photos to ~300-500 KB before base64 encoding.
+    Returns (compressed_bytes, mime_type).
+    If compression fails, returns original bytes with inferred MIME type.
+    """
+    # Try to detect original format
+    mime = "image/jpeg"
+    if image_bytes[:8].startswith(b"\x89PNG"):
+        mime = "image/png"
+    elif image_bytes[:3] == b"GIF":
+        mime = "image/gif"
+    elif image_bytes[:4] == b"RIFF":
+        mime = "image/webp"
+
+    # If already small, skip compression
+    if len(image_bytes) < 800_000:  # < ~800 KB is fine
+        return image_bytes, mime
+
     try:
         img = Image.open(io.BytesIO(image_bytes))
-        # Convert palette/RGBA/etc to RGB for JPEG
-        if img.mode in ("RGBA", "P"):
+        orig_mode = img.mode
+        # Convert to RGB for JPEG output
+        if orig_mode in ("RGBA", "P", "LA", "L"):
             img = img.convert("RGB")
-        elif img.mode != "RGB":
+        elif orig_mode != "RGB":
             img = img.convert("RGB")
+
         img.thumbnail((MAX_DIM, MAX_DIM))
         buf = io.BytesIO()
         img.save(buf, "JPEG", quality=JPEG_Q, optimize=True)
-        return buf.getvalue()
-    except Exception:
-        # If Pillow fails (e.g. PDF), return original
-        return image_bytes
+        compressed = buf.getvalue()
+
+        # Only use compressed if it actually got smaller
+        if len(compressed) < len(image_bytes):
+            return compressed, "image/jpeg"
+        else:
+            return image_bytes, mime
+    except Exception as e:
+        print(f"[compress_image] Warning: compression failed ({e}), using original.")
+        return image_bytes, mime
 
 
-def extract_invoice(image_bytes: bytes, brand_code: str = "unassigned", brand_name: str = "") -> dict:
-    compressed = compress_image(image_bytes)
-    b64 = base64.b64encode(compressed).decode()
-    prompt = EXTRACTION_PROMPT.format(brand_name=brand_name or brand_code.upper())
-    url = f"{MOONSHOT_BASE}/chat/completions"
-    headers = {"Authorization": f"Bearer {MOONSHOT_KEY}", "Content-Type": "application/json"}
-    body = {
+def _build_request_body(prompt: str, b64: str, mime_type: str):
+    """Build the Moonshot API request body."""
+    return {
         "model": MOONSHOT_MODEL,
         "messages": [{
             "role": "user",
             "content": [
                 {"type": "text", "text": prompt},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{b64}"}}
             ]
         }],
-        "temperature": 0.1
+     
     }
 
-    for attempt in range(4):
-        try:
-            r = requests.post(url, json=body, headers=headers, timeout=(10, 180))
-            if r.status_code == 200:
-                break
-            if r.status_code == 429 and attempt < 3:
-                wait = 20 * (attempt + 1)
-                print(f"Rate limited, waiting {wait}s...")
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-        except requests.exceptions.Timeout:
-            if attempt < 3:
-                print(f"Moonshot timed out, retry {attempt + 1}/3...")
-                time.sleep(5 * (attempt + 1))
-                continue
-            raise
-        except requests.exceptions.RequestException as e:
-            if attempt == 3:
-                raise
-            time.sleep(5)
-            continue
+
+def _call_moonshot(image_bytes: bytes, brand_code: str, brand_name: str, use_compressed: bool = True) -> dict:
+    """Single Moonshot call. Returns parsed dict or raises on unrecoverable error."""
+    if use_compressed:
+        data_to_send, mime_type = compress_image(image_bytes)
     else:
-        r.raise_for_status()
+        # Detect MIME without compression
+        mime_type = "image/jpeg"
+        if image_bytes[:8].startswith(b"\x89PNG"):
+            mime_type = "image/png"
+        data_to_send = image_bytes
+
+    b64 = base64.b64encode(data_to_send).decode()
+    prompt = EXTRACTION_PROMPT.format(brand_name=brand_name or brand_code.upper())
+    url = f"{MOONSHOT_BASE}/chat/completions"
+    headers = {"Authorization": f"Bearer {MOONSHOT_KEY}", "Content-Type": "application/json"}
+    body = _build_request_body(prompt, b64, mime_type)
+
+    r = requests.post(url, json=body, headers=headers, timeout=(10, 180))
+    r.raise_for_status()
 
     text = r.json()["choices"][0]["message"]["content"].strip()
     text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
@@ -132,6 +161,64 @@ def extract_invoice(image_bytes: bytes, brand_code: str = "unassigned", brand_na
     parsed["_raw_response"] = text
     parsed["_brand_code"] = brand_code
     return parsed
+
+
+def extract_invoice(image_bytes: bytes, brand_code: str = "unassigned", brand_name: str = "") -> dict:
+    _smooth_gap(min_gap=3.0)
+
+    # Attempt 1: compressed (or original if already small)
+    for attempt in range(2):
+        try:
+            # First try: compressed. Second try (only on 400): uncompressed original.
+            use_compressed = (attempt == 0)
+            return _call_moonshot(image_bytes, brand_code, brand_name, use_compressed=use_compressed)
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response else 0
+            if status == 400 and attempt == 0:
+                print(f"[Moonshot] 400 Bad Request with compressed image, retrying with original...")
+                time.sleep(2)
+                continue
+            if status == 429:
+                # Exponential backoff for 429
+                wait = 30 * (2 ** attempt)
+                print(f"[Moonshot] 429 rate limited, attempt {attempt + 1}/2, waiting {wait}s...")
+                time.sleep(wait)
+                continue
+            # Any other HTTP error — retry once then fail soft
+            if attempt == 0:
+                print(f"[Moonshot] HTTP {status}, retrying once...")
+                time.sleep(5)
+                continue
+            return _soft_fail(brand_code, f"HTTP {status}: {e}")
+        except requests.exceptions.Timeout:
+            if attempt == 0:
+                print("[Moonshot] Timeout, retrying with original image...")
+                time.sleep(5)
+                continue
+            return _soft_fail(brand_code, "Moonshot timed out after 2 attempts")
+        except requests.exceptions.RequestException as e:
+            if attempt == 0:
+                print(f"[Moonshot] Request error: {e}, retrying once...")
+                time.sleep(5)
+                continue
+            return _soft_fail(brand_code, f"Request error: {e}")
+
+    return _soft_fail(brand_code, "All attempts exhausted")
+
+
+def _soft_fail(brand_code: str, note: str) -> dict:
+    """Return a structured soft failure so the bot doesn't crash."""
+    return {
+        "date": None, "invoice_no": None, "vendor": None,
+        "total": None, "tax": None, "currency": "HKD",
+        "category": "UNCATEGORIZED", "sub_category": None,
+        "confidence": "low",
+        "notes": f"[API_ERROR] {note}. Please retry in 2 minutes.",
+        "items": [],
+        "_rate_limited": True,
+        "_raw_response": "",
+        "_brand_code": brand_code
+    }
 
 
 def validate_totals(data: dict) -> dict:

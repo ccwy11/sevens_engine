@@ -52,6 +52,36 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, brand
             )
         extracted = validate_totals(extracted)
 
+        # Rate-limited soft failure: save the raw file, tell user to retry
+        if extracted.get("_rate_limited"):
+            payload = {
+                "brand": brand,
+                "input_channel": f"{brand}_bot",
+                "date": None,
+                "invoice_no": None,
+                "vendor": None,
+                "total": None,
+                "tax": None,
+                "currency": "HKD",
+                "category": "UNCATEGORIZED",
+                "sub_category": None,
+                "confidence": "low",
+                "prompt_version": "v1",
+                "raw_json": {"response": "", "parsed": {}},
+                "drive_file_id": drive_id,
+                "source_file": filename,
+                "notes": extracted.get("notes", ""),
+                "status": "needs_review",
+                "items": []
+            }
+            invoice_id = save_invoice(payload)
+            await msg.reply_text(
+                f"⏳ Receipt #{invoice_id} saved, but Moonshot is rate-limited right now.\n"
+                f"Please retry this receipt in 2 minutes, or review it in the dashboard later.\n"
+                f"File: {filename}"
+            )
+            return
+
         payload = {
             "brand": brand,
             "input_channel": f"{brand}_bot",

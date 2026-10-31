@@ -3,13 +3,8 @@ import json
 import psycopg2
 from psycopg2.extras import RealDictCursor, Json
 from contextlib import contextmanager
-from dotenv import load_dotenv
-load_dotenv()          # reads .env from the current working directory
 
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL environment variable is not set.")
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 INIT_SQL = """
 CREATE TABLE IF NOT EXISTS brands (
@@ -175,7 +170,7 @@ def update_invoice_status(invoice_id: int, status: str):
                 UPDATE invoices SET status = %s, updated_at = NOW() WHERE id = %s
             """, (status, invoice_id))
 
-def list_invoices(brand: str = None, status: str = None, limit: int = 100):
+def list_invoices(brand: str = None, status: str = None, statuses: list = None, limit: int = 100):
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             where = []
@@ -183,7 +178,10 @@ def list_invoices(brand: str = None, status: str = None, limit: int = 100):
             if brand:
                 where.append("b.code = %s")
                 params.append(brand)
-            if status:
+            if statuses:
+                where.append("i.status = ANY(%s)")
+                params.append(statuses)
+            elif status:
                 where.append("i.status = %s")
                 params.append(status)
             sql = """
@@ -197,6 +195,23 @@ def list_invoices(brand: str = None, status: str = None, limit: int = 100):
             params.append(limit)
             cur.execute(sql, params)
             return cur.fetchall()
+
+def delete_invoice(invoice_id: int):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM invoices WHERE id = %s", (invoice_id,))
+
+def update_invoice_fields(invoice_id: int, fields: dict):
+    """Edit invoice fields. fields = {'vendor': 'New Name', 'total': 123.45, ...}"""
+    allowed = {"date", "vendor", "total", "tax", "currency", "category", "sub_category", "notes", "status"}
+    to_update = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    if not to_update:
+        return
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            set_clause = ", ".join(f"{k} = %s" for k in to_update)
+            values = list(to_update.values()) + [invoice_id]
+            cur.execute(f"UPDATE invoices SET {set_clause}, updated_at = NOW() WHERE id = %s", values)
 
 def enqueue_job(job_type: str, payload: dict) -> int:
     import json
