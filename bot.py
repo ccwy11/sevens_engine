@@ -15,6 +15,9 @@ BRAND_NAMES = {
     "unassigned": "Unassigned / Test"
 }
 
+# Limit concurrent Moonshot vision calls so 3 simultaneous receipts don't fire 3 giants at once
+LLM_SEM = asyncio.Semaphore(2)
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, brand: str):
     msg = update.message
     photo = msg.photo[-1] if msg.photo else None
@@ -39,7 +42,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, brand
 
         drive_id = upload_file(bytes_data, filename, "image/jpeg" if ext in ("jpg", "jpeg", "png") else "application/pdf")
 
-        extracted = extract_invoice(bytes_data, brand_code=brand, brand_name=BRAND_NAMES.get(brand, brand))
+        # Offload blocking LLM call to a thread so the event loop stays responsive for other bots
+        async with LLM_SEM:
+            extracted = await asyncio.to_thread(
+                extract_invoice,
+                bytes_data,
+                brand_code=brand,
+                brand_name=BRAND_NAMES.get(brand, brand)
+            )
         extracted = validate_totals(extracted)
 
         payload = {

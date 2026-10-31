@@ -1,8 +1,10 @@
 import json
 import base64
+import io
 import requests
 import time
 from typing import List, Dict
+from PIL import Image
 from config import MOONSHOT_KEY, MOONSHOT_BASE, MOONSHOT_MODEL
 
 EXTRACTION_PROMPT = """You are an invoice extraction engine for a Hong Kong restaurant group.
@@ -48,8 +50,31 @@ Important:
 - Default currency is HKD if not visible on receipt.
 """
 
+MAX_DIM = 1600
+JPEG_Q = 80
+
+
+def compress_image(image_bytes: bytes) -> bytes:
+    """Resize large phone photos to ~300-500 KB before base64 encoding."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        # Convert palette/RGBA/etc to RGB for JPEG
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        img.thumbnail((MAX_DIM, MAX_DIM))
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=JPEG_Q, optimize=True)
+        return buf.getvalue()
+    except Exception:
+        # If Pillow fails (e.g. PDF), return original
+        return image_bytes
+
+
 def extract_invoice(image_bytes: bytes, brand_code: str = "unassigned", brand_name: str = "") -> dict:
-    b64 = base64.b64encode(image_bytes).decode()
+    compressed = compress_image(image_bytes)
+    b64 = base64.b64encode(compressed).decode()
     prompt = EXTRACTION_PROMPT.format(brand_name=brand_name or brand_code.upper())
     url = f"{MOONSHOT_BASE}/chat/completions"
     headers = {"Authorization": f"Bearer {MOONSHOT_KEY}", "Content-Type": "application/json"}
@@ -62,12 +87,12 @@ def extract_invoice(image_bytes: bytes, brand_code: str = "unassigned", brand_na
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
             ]
         }],
-       
+        "temperature": 0.1
     }
 
     for attempt in range(4):
         try:
-            r = requests.post(url, json=body, headers=headers, timeout=60)
+            r = requests.post(url, json=body, headers=headers, timeout=(10, 180))
             if r.status_code == 200:
                 break
             if r.status_code == 429 and attempt < 3:
@@ -76,6 +101,12 @@ def extract_invoice(image_bytes: bytes, brand_code: str = "unassigned", brand_na
                 time.sleep(wait)
                 continue
             r.raise_for_status()
+        except requests.exceptions.Timeout:
+            if attempt < 3:
+                print(f"Moonshot timed out, retry {attempt + 1}/3...")
+                time.sleep(5 * (attempt + 1))
+                continue
+            raise
         except requests.exceptions.RequestException as e:
             if attempt == 3:
                 raise
@@ -101,6 +132,7 @@ def extract_invoice(image_bytes: bytes, brand_code: str = "unassigned", brand_na
     parsed["_raw_response"] = text
     parsed["_brand_code"] = brand_code
     return parsed
+
 
 def validate_totals(data: dict) -> dict:
     items = data.get("items", [])
